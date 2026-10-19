@@ -560,6 +560,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) emit_events: bool,
 
     _subscriptions: Vec<Subscription>,
+    _window_subscriptions: Vec<Subscription>,
+    window_id: Option<gpui::WindowId>,
 
     pub(super) auto_scroll: AutoScroll,
 }
@@ -838,24 +840,11 @@ impl<M: InputModeKind> InputBaseState<M> {
             }),
             // Observe the blink cursor to repaint the view when it changes.
             cx.observe(&blink_cursor, |_, _, cx| cx.notify()),
-            // Blink the cursor when the window is active, pause when it's not.
-            cx.observe_window_activation(window, |input, window, cx| {
-                if window.is_window_active() {
-                    let focus_handle = input.focus_handle.clone();
-                    if focus_handle.is_focused(window) {
-                        input.blink_cursor.update(cx, |blink_cursor, cx| {
-                            blink_cursor.start(cx);
-                        });
-                    }
-                }
-            }),
-            cx.on_focus(&focus_handle, window, Self::on_focus),
-            cx.on_blur(&focus_handle, window, Self::on_blur),
         ];
 
         let text_style = window.text_style();
 
-        Self {
+        let mut state = Self {
             extras: M::Extras::default(),
             focus_handle: focus_handle.clone(),
             selection_focus: None,
@@ -933,10 +922,49 @@ impl<M: InputModeKind> InputBaseState<M> {
             silent_replace_text: false,
             emit_events: true,
             _subscriptions,
+            _window_subscriptions: Vec::new(),
+            window_id: None,
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
+        };
+        state.attach_window(window, cx);
+        state
+    }
+
+    /// Rebinds window listeners when this input moves to another window.
+    ///
+    /// Call before using the retained state in the new window. Text, selection,
+    /// and undo history are preserved; focus is not transferred. Reattaching to
+    /// the same window does nothing. A state can be attached to only one window.
+    pub fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.window_id == Some(window.window_handle().window_id()) {
+            return;
         }
+
+        self._window_subscriptions.clear();
+        self.window_id = Some(window.window_handle().window_id());
+        self.blink_cursor.update(cx, |cursor, cx| {
+            cursor.stop(cx);
+            if self.focus_handle.is_focused(window) {
+                cursor.start(cx);
+            }
+        });
+        self._window_subscriptions = vec![
+            // Blink the cursor when the window is active, pause when it's not.
+            cx.observe_window_activation(window, |input, window, cx| {
+                if window.is_window_active() {
+                    let focus_handle = input.focus_handle.clone();
+                    if focus_handle.is_focused(window) {
+                        input.blink_cursor.update(cx, |blink_cursor, cx| {
+                            blink_cursor.start(cx);
+                        });
+                    }
+                }
+            }),
+            cx.on_focus(&self.focus_handle, window, Self::on_focus),
+            cx.on_blur(&self.focus_handle, window, Self::on_blur),
+        ];
     }
 
     /// Sets whether the context menu that shows on right-click is enabled.
@@ -5049,6 +5077,87 @@ mod tests {
             assert_eq!(search.autocapitalize, Autocapitalize::Words);
             assert!(search.autocorrect);
             assert!(search.suggestions);
+        });
+    }
+
+    #[gpui::test]
+    fn test_attach_window(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::<InputMode>::build(cx, |state| state);
+        let input = view.input;
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            window.activate_window();
+            let focus_handle = input.read(cx).focus_handle.clone();
+            focus_handle.focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.simulate_input("draft");
+        input.update(&mut cx, |state, cx| state.set_selected_range(1..3, cx));
+        cx.update(|window, cx| {
+            window.blur(cx);
+            window.draw(cx).clear(cx);
+            window.remove_window();
+        });
+
+        let (_, cx) = cx.cx.add_window_view(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.attach_window(window, cx);
+                state.attach_window(window, cx);
+            });
+            window.activate_window();
+            TestRoot(input.clone())
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        input.read_with(cx, |state, cx| {
+            assert_eq!(state.value(), "draft");
+            assert_eq!(state.selected_range(), 1..3);
+            assert!(!state.blink_cursor.read(cx).visible());
+        });
+        let events = Rc::new(Cell::new((0, 0)));
+        let received = events.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &InputEvent, _| {
+                let (mut focused, mut blurred) = received.get();
+                match event {
+                    InputEvent::Focus => focused += 1,
+                    InputEvent::Blur => blurred += 1,
+                    _ => return,
+                }
+                received.set((focused, blurred));
+            })
+        });
+        cx.update(|window, cx| {
+            let focus_handle = input.read(cx).focus_handle.clone();
+            focus_handle.focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(events.get(), (1, 0));
+        assert!(input.read_with(cx, |state, cx| state.blink_cursor.read(cx).visible()));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert!(!state.blink_cursor.read(cx).visible());
+                state.attach_window(window, cx);
+                assert!(!state.blink_cursor.read(cx).visible());
+            });
+            window.blur(cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(events.get(), (1, 1));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        assert!(!input.read_with(cx, |state, cx| state.blink_cursor.read(cx).visible()));
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "");
+            });
         });
     }
 
