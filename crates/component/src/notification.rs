@@ -22,7 +22,7 @@ use gpui_base::{
 use crate::{
     ActiveTheme as _, Edges, Icon, IconName, Sizable as _, StyledExt, TITLE_BAR_HEIGHT,
     animation::cubic_bezier,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     styled::toast_shadow,
     v_flex,
 };
@@ -463,6 +463,14 @@ impl Render for Notification {
                         Button::new("close")
                             .icon(IconName::Close)
                             .ghost()
+                            .when_some(self.style.text.color, |this, foreground| {
+                                this.custom(
+                                    ButtonCustomVariant::new(cx)
+                                        .foreground(foreground)
+                                        .hover(foreground.opacity(0.12))
+                                        .active(foreground.opacity(0.18)),
+                                )
+                            })
                             .xsmall()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 cx.stop_propagation();
